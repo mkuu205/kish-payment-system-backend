@@ -2,51 +2,41 @@ const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const Transaction = require('../models/Transaction');
 
-/**
- * Generate unique transaction ID
- * Format: KISH-{timestamp}-{random}
- */
+// Generate unique transaction ID
 const generateTransactionId = () => {
-    const timestamp = Date.now();
-    const random = Math.random().toString(36).substr(2, 6).toUpperCase();
-    return `KISH-${timestamp}-${random}`;
+    return `KISH-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
 };
 
-/**
- * Generate unique message ID for M-Pesa request
- */
+// Generate message ID
 const generateMessageId = () => {
     return `MSG-${Date.now()}-${uuidv4().substr(0, 8)}`;
 };
 
-/**
- * POST /api/payment/stkpush
- * Initiate STK Push payment
- */
+// POST /api/payment/stkpush
 exports.initiateSTKPush = async (req, res) => {
     try {
         const { phone, amount } = req.body;
         
-        console.log(`📱 Initiating STK Push for ${phone} amount ${amount}`);
+        console.log(`📱 Initiating payment for ${phone} - KES ${amount}`);
         
-        // Generate unique transaction ID
+        // Generate transaction ID
         const transactionId = generateTransactionId();
         const invoiceNumber = `INV-${Date.now()}`;
         const messageId = generateMessageId();
         
-        // Create pending transaction in database
+        // Save transaction
         const transaction = new Transaction({
             phone,
             amount,
             transactionId,
             status: 'PENDING'
         });
-        
         await transaction.save();
+        
         console.log(`✅ Transaction saved: ${transactionId}`);
         
-        // Prepare STK Push request payload
-        const stkPushData = {
+        // Prepare STK Push data
+        const stkData = {
             phoneNumber: phone,
             amount: amount.toString(),
             invoiceNumber: invoiceNumber,
@@ -57,12 +47,12 @@ exports.initiateSTKPush = async (req, res) => {
             transactionDescription: "Kish Payment"
         };
         
-        console.log('📤 Sending STK Push to M-Pesa...');
+        console.log('📤 Sending to M-Pesa...');
         
-        // Send STK Push to M-Pesa API (KCB Buni API)
+        // Send to M-Pesa API
         const response = await axios.post(
             'https://uat.buni.kcbgroup.com/mm/api/request/1.0.0/stkpush',
-            stkPushData,
+            stkData,
             {
                 headers: {
                     'routeCode': '207',
@@ -77,7 +67,7 @@ exports.initiateSTKPush = async (req, res) => {
         
         console.log('📥 M-Pesa Response:', response.data);
         
-        // Update transaction with M-Pesa request IDs
+        // Update transaction with M-Pesa IDs
         if (response.data) {
             if (response.data.MerchantRequestID) {
                 transaction.merchantRequestId = response.data.MerchantRequestID;
@@ -88,13 +78,10 @@ exports.initiateSTKPush = async (req, res) => {
             await transaction.save();
         }
         
-        // Return success response
-        res.status(200).json({
+        res.json({
             success: true,
             message: 'STK Push sent successfully',
-            transactionId: transaction.transactionId,
-            checkoutRequestId: response.data?.CheckoutRequestID,
-            merchantRequestId: response.data?.MerchantRequestID
+            transactionId: transaction.transactionId
         });
         
     } catch (error) {
@@ -102,107 +89,67 @@ exports.initiateSTKPush = async (req, res) => {
         
         res.status(500).json({
             success: false,
-            message: 'Failed to initiate payment',
-            error: error.response?.data?.errorMessage || error.message
+            message: error.response?.data?.errorMessage || 'Failed to initiate payment'
         });
     }
 };
 
-/**
- * POST /api/payment/callback
- * Handle M-Pesa callback response
- */
+// POST /api/payment/callback
 exports.handleCallback = async (req, res) => {
     try {
-        console.log('📞 Received M-Pesa Callback:', JSON.stringify(req.body, null, 2));
+        console.log('📞 Callback received:', JSON.stringify(req.body, null, 2));
         
         const callbackData = req.body;
-        
-        // Extract callback data
         const stkCallback = callbackData?.Body?.stkCallback;
+        
         if (!stkCallback) {
-            console.error('Invalid callback structure');
-            return res.status(200).json({ success: false, message: 'Invalid callback' });
+            console.log('Invalid callback structure');
+            return res.status(200).json({ success: false });
         }
         
         const checkoutRequestID = stkCallback.CheckoutRequestID;
-        const merchantRequestID = stkCallback.MerchantRequestID;
         const resultCode = stkCallback.ResultCode;
         const resultDesc = stkCallback.ResultDesc;
-        const callbackMetadata = stkCallback.CallbackMetadata;
         
-        console.log(`Processing callback for CheckoutID: ${checkoutRequestID}, ResultCode: ${resultCode}`);
-        
-        // Find transaction by checkout request ID
-        let transaction = await Transaction.findOne({
-            $or: [
-                { checkoutRequestId: checkoutRequestID },
-                { merchantRequestId: merchantRequestID }
-            ]
-        });
+        // Find transaction
+        const transaction = await Transaction.findOne({ checkoutRequestId: checkoutRequestID });
         
         if (!transaction) {
-            console.error('Transaction not found for callback:', { checkoutRequestID, merchantRequestID });
-            return res.status(200).json({ 
-                success: false, 
-                message: 'Transaction not found' 
-            });
+            console.log('Transaction not found:', checkoutRequestID);
+            return res.status(200).json({ success: false });
         }
         
-        // Update transaction based on result code
+        // Update status
         if (resultCode === 0) {
-            // Success
             transaction.status = 'SUCCESS';
-            transaction.resultCode = resultCode;
-            transaction.resultDesc = resultDesc;
             
-            // Extract M-Pesa receipt number
-            if (callbackMetadata && callbackMetadata.Item) {
-                const receiptItem = callbackMetadata.Item.find(item => item.Name === 'MpesaReceiptNumber');
+            // Get M-Pesa receipt number
+            const metadata = stkCallback.CallbackMetadata;
+            if (metadata && metadata.Item) {
+                const receiptItem = metadata.Item.find(item => item.Name === 'MpesaReceiptNumber');
                 if (receiptItem) {
                     transaction.mpesaReceiptNumber = receiptItem.Value;
                 }
-                
-                // Verify amount matches
-                const amountItem = callbackMetadata.Item.find(item => item.Name === 'Amount');
-                if (amountItem && amountItem.Value !== transaction.amount) {
-                    console.warn(`⚠️ Amount mismatch: Expected ${transaction.amount}, Got ${amountItem.Value}`);
-                }
             }
-            
             console.log(`✅ Payment successful: ${transaction.transactionId}`);
         } else {
-            // Failed
             transaction.status = 'FAILED';
-            transaction.resultCode = resultCode;
             transaction.resultDesc = resultDesc;
             console.log(`❌ Payment failed: ${transaction.transactionId} - ${resultDesc}`);
         }
         
+        transaction.resultCode = resultCode;
         await transaction.save();
-        console.log(`💾 Transaction updated: ${transaction.transactionId} -> ${transaction.status}`);
         
-        // Always return 200 to M-Pesa to prevent retries
-        res.status(200).json({
-            success: true,
-            message: 'Callback processed successfully'
-        });
+        res.status(200).json({ success: true });
         
     } catch (error) {
-        console.error('❌ Callback processing error:', error);
-        
-        // Still return 200 to M-Pesa
-        res.status(200).json({
-            success: false,
-            message: 'Error processing callback'
-        });
+        console.error('Callback error:', error);
+        res.status(200).json({ success: false });
     }
 };
 
-/**
- * GET /api/payment/status/:transactionId
- * Get payment status
- */
+// GET /api/payment/status/:transactionId
 exports.getTransactionStatus = async (req, res) => {
     try {
         const { transactionId } = req.params;
@@ -216,7 +163,7 @@ exports.getTransactionStatus = async (req, res) => {
             });
         }
         
-        res.status(200).json({
+        res.json({
             success: true,
             status: transaction.status,
             transaction: {
@@ -231,51 +178,31 @@ exports.getTransactionStatus = async (req, res) => {
         });
         
     } catch (error) {
-        console.error('Get status error:', error);
+        console.error('Status error:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to fetch transaction status'
+            message: 'Failed to get status'
         });
     }
 };
 
-/**
- * GET /api/payment/transactions
- * Get all transactions (public - limited to last 50)
- */
+// GET /api/payment/transactions
 exports.getAllTransactions = async (req, res) => {
     try {
-        const { page = 1, limit = 20, status } = req.query;
+        const transactions = await Transaction.find()
+            .sort({ createdAt: -1 })
+            .limit(50);
         
-        const filter = {};
-        if (status) filter.status = status;
-        
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        
-        const [transactions, total] = await Promise.all([
-            Transaction.find(filter)
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(parseInt(limit)),
-            Transaction.countDocuments(filter)
-        ]);
-        
-        res.status(200).json({
+        res.json({
             success: true,
-            data: transactions,
-            pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
-                total,
-                pages: Math.ceil(total / parseInt(limit))
-            }
+            data: transactions
         });
         
     } catch (error) {
         console.error('Get transactions error:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to fetch transactions'
+            message: 'Failed to get transactions'
         });
     }
 };
