@@ -10,7 +10,6 @@
   "dependencies": {
     "express": "^4.18.2",
     "mongoose": "^7.5.0",
-    "license": "MIT", 
     "axios": "^1.5.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
